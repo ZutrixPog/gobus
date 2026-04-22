@@ -1,77 +1,197 @@
 # gobus
 
-A tiny event bus library for Go that wraps pub/sub systems. Because sometimes you just want to send messages around without losing your mind.
+Event bus library for Go wrapping common pub/sub systems.
 
-## Why
+## Overview
 
-Got tired of wiring up event buses differently for every project. This gives you one interface, plug in whatever broker you like.
+gobus provides a unified interface for event-driven communication across multiple message brokers. It handles publish/subscribe patterns, RPC-style request/response, and worker queue semantics with automatic serialization, retry logic, and middleware support.
+
+## Installation
+
+```bash
+go get github.com/zutrixpog/gobus
+```
 
 ## Quick Start
 
 ```go
-import "github.com/zutrixpog/gobus"
+import (
+    "context"
+    "github.com/zutrixpog/gobus"
+    "github.com/zutrixpog/gobus/pubsub/nats"
+)
 
 type UserCreated struct {
-    ID    int
-    Email string
+    ID    int    `json:"id"`
+    Email string `json:"email"`
 }
 
 type GetUserRequest struct {
-    ID int
+    ID int `json:"id"`
 }
 
 type GetUserResponse struct {
-    Name  string
-    Email string
+    Name  string `json:"name"`
+    Email string `json:"email"`
 }
 
-// Init with your favorite broker
-bus.Init(yourPubSubAdapter, bus.BusConfig{
-    RpcPrefix: "myapp",
-})
+func main() {
+    conn, _ := nats.Connect("nats://localhost:4222")
+    ps, _ := nats.NewNatsPubSub(conn, "gobus", []string{"gobus.*"}, 0)
 
-// Say hello to handlers
-bus.Handle("user.created", func(ctx context.Context, evt UserCreated, meta bus.Event) error {
-    fmt.Printf("user %d created with email %s\n", evt.ID, evt.Email)
-    return nil
-})
+    gobus.Init(ps, gobus.BusConfig{
+        RpcPrefix: "myapp",
+    })
 
-// Or go full RPC style with type safety
-bus.Handle("user.get", func(ctx context.Context, req GetUserRequest) (GetUserResponse, error) {
-    return GetUserResponse{Name: "taco", Email: "taco@example.com"}, nil
-})
+    // Event handler
+    gobus.Handle("user.created", func(ctx context.Context, evt UserCreated, meta gobus.Event) error {
+        fmt.Printf("user %d created: %s\n", evt.ID, evt.Email)
+        return nil
+    })
 
-// Send stuff
-bus.Publish(ctx, "user.created", UserCreated{ID: 42, Email: "taco@example.com"})
+    // RPC handler
+    gobus.Handle("user.get", func(ctx context.Context, req GetUserRequest) (GetUserResponse, error) {
+        return GetUserResponse{Name: "taco", Email: "taco@example.com"}, nil
+    })
 
-// Or call and wait for a response
-res, err := bus.Call[GetUserRequest, GetUserResponse](ctx, "user.get", GetUserRequest{ID: 42})
+    gobus.Start()
+
+    // Publish event
+    gobus.Publish(context.Background(), "user.created", UserCreated{ID: 42, Email: "taco@example.com"})
+
+    // RPC call
+    res, _ := gobus.Call[GetUserRequest, GetUserResponse](context.Background(), "user.get", GetUserRequest{ID: 42})
+    
+    // Graceful shutdown
+    gobus.Shutdown(gobus.WithShutdownTimeout(30 * time.Second))
+}
 ```
 
-## Adapters
-
-Pick your poison:
+## Pub/Sub Adapters
 
 | Broker | Package | Notes |
 |--------|---------|-------|
-| NATS | `pubsub/nats` | JetStream for persistence |
-| Redis | `pubsub/redis` | Streams for the queue stuff |
-| MQTT | `pubsub/mqtt` | IoT vibes |
+| NATS | `pubsub/nats` | JetStream for persistence and replay |
+| Redis | `pubsub/redis` | Streams API for work queues |
+| MQTT | `pubsub/mqtt` | QoS levels 0-1 |
 
-## Features Nobody Asked For But You Get Anyway
+## API Reference
 
-- **Middleware** - chain stuff before handlers
-- **Retry logic** - with backoff, because networks lie
-- **Correlation IDs** - for when things go sideways and you need to trace them
-- **Graceful shutdown** - drain mode so you don't drop messages on the floor
-- **Pluggable serializers** - JSON, Gob, or roll your own
+### Initialization
+
+```go
+gobus.Init(ps pubsub.PubSub, config BusConfig)
+```
+
+**BusConfig** fields:
+
+| Field | Type | Default | Description |
+|-------|------|--------|-------------|
+| RpcPrefix | string | "rpc" | Topic prefix for RPC calls |
+| Serializer | Serializer | GobSerializer | Payload serialization |
+| PublishQueueSize | int | 1024 | Channel buffer for publishing |
+| LogChannelSize | int | 512 | Log entries buffer |
+| RpcTimeout | time.Duration | 30s | Default RPC timeout |
+| HandlerAckWait | time.Duration | 30s | Handler ack wait time |
+| MonitorInterval | time.Duration | 5s | Status monitor tick |
+
+### Handlers
+
+```go
+// Event handler (one-way)
+gobus.Handle(topic string, handler func(ctx context.Context, T, meta Event) error, opts ...HandlerOpt)
+
+// RPC handler (request/response)
+gobus.Serve(endpoint string, handler func(ctx context.Context, T) (T, error), opts ...HandlerOpt)
+```
+
+**Handler Options:**
+
+| Option | Description |
+|--------|-------------|
+| `WithConcurrency(n)` | Number of concurrent handlers |
+| `WithRetry(n, delay)` | Retry n times with backoff delay |
+| `WithBackPressure()` | Apply backpressure on full queue |
+| `WithExactlyOnce()` | Deduplicate within ack window |
+| `WithMiddleware(...)` | Chain middleware functions |
+| `WithRetryQueue(n, delay)` | Queue failed messages for retry |
+
+### Publishing
+
+```go
+// Fire-and-forget
+gobus.Publish(ctx context.Context, topic string, payload T, opts ...PublishOpt) error
+
+// Request-response
+gobus.Call[T, R](ctx context.Context, endpoint string, payload T, opts ...RpcOpt) (R, error)
+```
+
+**Publish Options:**
+
+| Option | Description |
+|--------|-------------|
+| `WithCorrelationID(id)` | Set correlation ID |
+| `WithTraceID(id)` | Set trace ID |
+| `WithRpcTimeout(d)` | Override RPC timeout |
+
+### Status
+
+```go
+gobus.IsRunning() bool
+gobus.IsDraining() bool
+gobus.HandlerCount() int
+gobus.Handlers() []string
+gobus.HasHandler(topic string) bool
+gobus.RemoveHandler(topic string) bool
+gobus.Logs() chan LogEntry
+```
+
+### Shutdown
+
+```go
+gobus.Shutdown(opts ...ShutdownOpt)
+```
+
+**Shutdown Options:**
+
+| Option | Description |
+|--------|-------------|
+| `WithShutdownTimeout(d)` | Max time to drain |
+
+## Serialization
+
+Two built-in serializers:
+
+- `gobus.DefaultSerializer()` - Gob (binary, faster)
+- `gobus.JsonSerializer()` - JSON text
+
+Custom serializer implements:
+
+```go
+type Serializer interface {
+    Encode(any) ([]byte, error)
+    Decode([]byte, any) error
+}
+```
+
+## Logging
+
+Receive log entries:
+
+```go
+go func() {
+    for entry := range gobus.Logs() {
+        fmt.Printf("[%s] %s\n", entry.Level, entry.Message)
+    }
+}()
+```
+
+Log levels: `debug`, `info`, `warn`, `error`
 
 ## Testing
 
 ```bash
-go test ./...
+go test ./... -cover
 ```
 
-Uses Docker containers for integration tests (dockertest). Make sure Docker is running or those tests will cry.
-
-MIT or whatever, use it, don't be a jerk about it.
+Integration tests require Docker (dockertest).
