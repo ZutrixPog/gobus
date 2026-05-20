@@ -73,6 +73,8 @@ type (
 		concurrency  int
 		topic        string
 		once         bool
+		dedupMap     *sync.Map
+		cleanupOnce  sync.Once
 	}
 
 	BusConfig struct {
@@ -411,6 +413,59 @@ func WithMiddleware[T any](middlewares ...Middleware[T]) func(*HandlerWrapper) {
 			hw.middlewares = append(hw.middlewares, mid)
 		}
 	}
+}
+
+func WithDedup[T any](dur time.Duration) func(*HandlerWrapper) {
+	return func(hw *HandlerWrapper) {
+		if hw.dedupMap == nil {
+			hw.dedupMap = &sync.Map{}
+		}
+
+		hw.startDedupCleanup(dur)
+
+		var mid Middleware[T] = func(next HandlerFunc[T]) HandlerFunc[T] {
+			return func(ctx context.Context, evt T, meta Event) error {
+				now := time.Now()
+				key := meta.CorrelationID
+
+				if val, ok := hw.dedupMap.Load(key); ok {
+					expiry := val.(time.Time)
+					if now.Before(expiry) {
+						return nil
+					}
+				}
+
+				hw.dedupMap.Store(key, now.Add(dur))
+				return next(ctx, evt, meta)
+			}
+		}
+
+		hw.middlewares = append(hw.middlewares, mid)
+	}
+}
+
+func (hw *HandlerWrapper) startDedupCleanup(interval time.Duration) {
+	hw.cleanupOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					now := time.Now()
+					hw.dedupMap.Range(func(key, value any) bool {
+						expiry := value.(time.Time)
+						if now.After(expiry) {
+							hw.dedupMap.Delete(key)
+						}
+						return true
+					})
+				case <-_bus.ctx.Done():
+					return
+				}
+			}
+		}()
+	})
 }
 
 func Publish(ctx context.Context, topic string, payload any, options ...func(*Event)) error {
