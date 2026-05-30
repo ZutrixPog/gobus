@@ -202,6 +202,33 @@ func TestMessageHandling(t *testing.T) {
 	})
 }
 
+func TestWithDedup(t *testing.T) {
+	topic := "gobus.test-dedup"
+	ctx := context.Background()
+	bus.Init(ps.(pubsub.PubSub), bus.BusConfig{})
+
+	count := 0
+	bus.Handle(topic, func(ctx context.Context, evt TestEvent, meta bus.Event) error {
+		count++
+		return nil
+	}, bus.WithDedup[TestEvent](time.Minute))
+
+	require.Nil(t, bus.Start())
+
+	correlationID := "dedup-test-id-42"
+
+	err := bus.Publish(ctx, topic, TestEvent{Name: "first"}, bus.WithCorrelationID(correlationID))
+	require.Nil(t, err)
+
+	time.Sleep(500 * time.Millisecond)
+
+	err = bus.Publish(ctx, topic, TestEvent{Name: "second"}, bus.WithCorrelationID(correlationID))
+	require.Nil(t, err)
+
+	time.Sleep(500 * time.Millisecond)
+	require.Equal(t, 1, count, "only first message should be processed, got %d", count)
+}
+
 func TestLogChannel(t *testing.T) {
 	logCh := bus.Logs()
 

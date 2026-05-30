@@ -40,14 +40,15 @@ func main() {
     ps, _ := nats.NewNatsPubSub(conn, "gobus", []string{"gobus.*"}, 0)
 
     gobus.Init(ps, gobus.BusConfig{
-        RpcPrefix: "myapp",
+        InstanceID: "order-svc-vm1",  // stable across restarts for dedup
+        RpcPrefix:  "myapp",
     })
 
     // Event handler
     gobus.Handle("user.created", func(ctx context.Context, evt UserCreated, meta gobus.Event) error {
         fmt.Printf("user %d created: %s\n", evt.ID, evt.Email)
         return nil
-    })
+    }, gobus.WithDedup[UserCreated](5*time.Minute))
 
     // RPC handler
     gobus.Handle("user.get", func(ctx context.Context, req GetUserRequest) (GetUserResponse, error) {
@@ -87,6 +88,7 @@ gobus.Init(ps pubsub.PubSub, config BusConfig)
 
 | Field | Type | Default | Description |
 |-------|------|--------|-------------|
+| InstanceID | string | random UUID | Stable identity for dedup scoping; set for restart resilience |
 | RpcPrefix | string | "rpc" | Topic prefix for RPC calls |
 | Serializer | Serializer | GobSerializer | Payload serialization |
 | PublishQueueSize | int | 1024 | Channel buffer for publishing |
@@ -112,7 +114,8 @@ gobus.Serve(endpoint string, handler func(ctx context.Context, T) (T, error), op
 | `WithConcurrency(n)` | Number of concurrent handlers |
 | `WithRetry(n, delay)` | Retry n times with backoff delay |
 | `WithBackPressure()` | Apply backpressure on full queue |
-| `WithExactlyOnce()` | Deduplicate within ack window |
+| `WithExactlyOnce()` | Broker-level once delivery |
+| `WithDedup[T](ttl)` | Application-level dedup by correlation ID; persistent when using Redis/NATS backends |
 | `WithMiddleware(...)` | Chain middleware functions |
 | `WithRetryQueue(n, delay)` | Queue failed messages for retry |
 
@@ -187,6 +190,22 @@ go func() {
 ```
 
 Log levels: `debug`, `info`, `warn`, `error`
+
+## Deduplication
+
+`WithDedup[T](ttl)` prevents processing the same message twice within a TTL window by tracking correlation IDs.
+
+### Backend auto-detection
+
+| Backend | Store | Survives restart |
+|---------|-------|------------------|
+| Redis | `SET NX EX` with `gobus:dedup:<InstanceID>:<correlationID>` | Yes (TTL-managed) |
+| NATS | JetStream KV bucket `gobus_dedup_<InstanceID>` | Yes (bucket TTL) |
+| MQTT, Mock, others | In-memory map | No |
+
+### Instance scoping
+
+Each bus instance must have a unique `InstanceID`. Two instances with the same ID share dedup state (one instance drops what the other processed).
 
 ## Testing
 

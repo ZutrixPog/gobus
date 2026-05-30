@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/zutrixpog/gobus/dedup"
 	"github.com/zutrixpog/gobus/pubsub"
 )
 
@@ -166,4 +167,9 @@ func (n *NatsPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubsu
 	}()
 
 	return appCh, nil
+}
+
+func (n *NatsPubSub) NewDedupStore(_ context.Context, instanceID string) (dedup.Store, error) {
+	bucket := fmt.Sprintf("gobus_dedup_%s", strings.ReplaceAll(instanceID, "-", "_"))
+	return dedup.NewNatsStore(n.js, bucket, 0)
 }

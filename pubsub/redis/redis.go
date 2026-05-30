@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/zutrixpog/gobus/dedup"
 	"github.com/zutrixpog/gobus/pubsub"
 )
 
@@ -165,4 +166,9 @@ func (r *RedisPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubs
 	}()
 
 	return ch, nil
+}
+
+func (r *RedisPubSub) NewDedupStore(_ context.Context, instanceID string) (dedup.Store, error) {
+	prefix := fmt.Sprintf("gobus:dedup:%s", instanceID)
+	return dedup.NewRedisStore(r.client, prefix), nil
 }

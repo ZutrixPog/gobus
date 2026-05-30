@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/zutrixpog/gobus/dedup"
 	"github.com/zutrixpog/gobus/pubsub"
 )
 
@@ -73,13 +74,12 @@ type (
 		concurrency  int
 		topic        string
 		once         bool
-		dedupMap     *sync.Map
-		cleanupOnce  sync.Once
 	}
 
 	BusConfig struct {
 		RpcPrefix  string
 		Serializer Serializer
+		InstanceID string
 
 		PublishQueueSize int
 		LogChannelSize   int
@@ -107,17 +107,19 @@ type (
 		cfg        BusConfig
 		serializer Serializer
 
-		handlers sync.Map
-		pubQueue chan Event
-		started  bool
-		draining bool
+		handlers   sync.Map
+		pubQueue   chan Event
+		started    bool
+		draining   bool
 
 		ctx    context.Context
 		cancel context.CancelFunc
 		wg     sync.WaitGroup
 
-		logCh     chan LogEntry
-		startedAt time.Time
+		logCh      chan LogEntry
+		startedAt  time.Time
+		instanceID string
+		dedupStore dedup.Store
 	}
 )
 
@@ -172,6 +174,10 @@ func Init(ps pubsub.PubSub, cfg BusConfig) *Bus {
 			cfg.RpcTimeout = 3 * time.Second
 		}
 
+		if cfg.InstanceID == "" {
+			cfg.InstanceID = uuid.New().String()
+		}
+
 		_bus = &Bus{
 			ps:         ps,
 			cfg:        cfg,
@@ -185,11 +191,28 @@ func Init(ps pubsub.PubSub, cfg BusConfig) *Bus {
 			cancel: cancel,
 			wg:     sync.WaitGroup{},
 
-			logCh: make(chan LogEntry, cfg.LogChannelSize),
+			logCh:      make(chan LogEntry, cfg.LogChannelSize),
+			instanceID: cfg.InstanceID,
 		}
+
+		_bus.initDedupStore()
 	}
 
 	return _bus
+}
+
+func (b *Bus) initDedupStore() {
+	if provider, ok := b.ps.(dedup.Provider); ok {
+		store, err := provider.NewDedupStore(b.ctx, b.instanceID)
+		if err != nil {
+			b.log(LogLevelWarn, "failed to create backend dedup store, falling back to memory", err, nil)
+		} else {
+			b.dedupStore = store
+			return
+		}
+	}
+
+	b.dedupStore = dedup.NewMemoryStore()
 }
 
 func Logs() <-chan LogEntry {
@@ -417,55 +440,22 @@ func WithMiddleware[T any](middlewares ...Middleware[T]) func(*HandlerWrapper) {
 
 func WithDedup[T any](dur time.Duration) func(*HandlerWrapper) {
 	return func(hw *HandlerWrapper) {
-		if hw.dedupMap == nil {
-			hw.dedupMap = &sync.Map{}
-		}
-
-		hw.startDedupCleanup(dur)
-
 		var mid Middleware[T] = func(next HandlerFunc[T]) HandlerFunc[T] {
 			return func(ctx context.Context, evt T, meta Event) error {
-				now := time.Now()
-				key := meta.CorrelationID
-
-				if val, ok := hw.dedupMap.Load(key); ok {
-					expiry := val.(time.Time)
-					if now.Before(expiry) {
-						return nil
-					}
+				ok, err := _bus.dedupStore.CheckAndMark(ctx, meta.CorrelationID, dur)
+				if err != nil {
+					_bus.log(LogLevelError, "dedup check failed, allowing message through", err, map[string]any{"topic": hw.topic})
+					return next(ctx, evt, meta)
 				}
-
-				hw.dedupMap.Store(key, now.Add(dur))
+				if !ok {
+					return nil
+				}
 				return next(ctx, evt, meta)
 			}
 		}
 
 		hw.middlewares = append(hw.middlewares, mid)
 	}
-}
-
-func (hw *HandlerWrapper) startDedupCleanup(interval time.Duration) {
-	hw.cleanupOnce.Do(func() {
-		go func() {
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					now := time.Now()
-					hw.dedupMap.Range(func(key, value any) bool {
-						expiry := value.(time.Time)
-						if now.After(expiry) {
-							hw.dedupMap.Delete(key)
-						}
-						return true
-					})
-				case <-_bus.ctx.Done():
-					return
-				}
-			}
-		}()
-	})
 }
 
 func Publish(ctx context.Context, topic string, payload any, options ...func(*Event)) error {
