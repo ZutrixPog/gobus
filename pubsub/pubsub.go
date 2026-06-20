@@ -8,6 +8,7 @@ import (
 type Message struct {
 	Data    []byte
 	Arrival time.Time
+	Context context.Context
 
 	Ack  func() error
 	Nack func() error

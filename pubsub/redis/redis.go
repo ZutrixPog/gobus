@@ -71,6 +71,7 @@ func (r *RedisPubSub) Subscribe(ctx context.Context, topic string, opts pubsub.S
 				case ch <- pubsub.Message{
 					Data:    []byte(msg.Payload),
 					Arrival: time.Now(),
+					Context: ctx,
 					Ack:     func() error { return nil },
 					Nack:    func() error { return nil },
 				}:
@@ -143,6 +144,7 @@ func (r *RedisPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubs
 						case ch <- pubsub.Message{
 							Data:    []byte(data),
 							Arrival: time.Now(),
+							Context: ctx,
 							Ack: func() error {
 								return r.client.XAck(ctx, streamKey, group, msgID).Err()
 							},

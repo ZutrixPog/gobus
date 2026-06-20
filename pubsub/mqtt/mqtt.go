@@ -109,6 +109,7 @@ func (m *MqttPubSub) createHandler(topic string) mqtt.MessageHandler {
 		pm := pubsub.Message{
 			Data:    msg.Payload(),
 			Arrival: time.Now(),
+			Context: context.Background(),
 			Ack: func() error {
 				msg.Ack()
 				return nil
@@ -180,6 +181,7 @@ func (m *MqttPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubsu
 			pm := pubsub.Message{
 				Data:    msg.Payload(),
 				Arrival: time.Now(),
+				Context: context.Background(),
 				Ack: func() error {
 					mu.Lock()
 					delete(received, msgID)

@@ -37,7 +37,7 @@ func (m *MockPubSub) Publish(ctx context.Context, topic string, data []byte) err
 	defer m.mu.Unlock()
 
 	noopAck := func() error { return nil }
-	msg := Message{Data: data, Arrival: time.Now(), Ack: noopAck, Nack: noopAck}
+	msg := Message{Data: data, Arrival: time.Now(), Context: ctx, Ack: noopAck, Nack: noopAck}
 
 	m.published = append(m.published, msg)
 

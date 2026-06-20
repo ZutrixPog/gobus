@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"github.com/zutrixpog/gobus/dedup"
 	"github.com/zutrixpog/gobus/pubsub"
 )
@@ -53,7 +55,9 @@ func (n *NatsPubSub) Connected() bool {
 }
 
 func (n *NatsPubSub) Publish(ctx context.Context, topic string, data []byte) error {
-	if _, err := n.js.Publish(topic, data); err != nil {
+	msg := &nats.Msg{Subject: topic, Data: data, Header: nats.Header{}}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(msg.Header))
+	if _, err := n.js.PublishMsg(msg); err != nil {
 		return fmt.Errorf("Publish failed on %s: %s", topic, err)
 	}
 
@@ -72,6 +76,7 @@ func (n *NatsPubSub) Subscribe(ctx context.Context, topic string, opts pubsub.Su
 		queueCh <- pubsub.Message{
 			Data:    msg.Data,
 			Arrival: time.Now(),
+			Context: otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(msg.Header)),
 			Ack:     func() error { return msg.Ack() },
 			Nack:    func() error { return msg.Nak() },
 		}
@@ -129,6 +134,7 @@ func (n *NatsPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubsu
 		queueCh <- pubsub.Message{
 			Data:    msg.Data,
 			Arrival: time.Now(),
+			Context: otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(msg.Header)),
 			Ack:     func() error { return msg.Ack() },
 			Nack:    func() error { return msg.Nak() },
 		}

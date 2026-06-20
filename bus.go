@@ -47,6 +47,7 @@ type (
 		retry   int
 		backoff time.Duration
 
+		ctx  context.Context
 		Time int64 `json:"published"`
 	}
 
@@ -280,12 +281,12 @@ func (b *Bus) startPublisher(ctx context.Context) {
 						return
 					}
 
-					err = b.ps.Publish(ctx, evt.Topic, eventPayload)
+					err = b.ps.Publish(evt.ctx, evt.Topic, eventPayload)
 					if err != nil {
 						b.log(LogLevelError, fmt.Sprintf("failed to publish event, %d retries left", evt.retry), err, map[string]any{"topic": evt.Topic})
 
 						for evt.retry > 0 {
-							err = b.ps.Publish(ctx, evt.Topic, evt.Payload)
+							err = b.ps.Publish(evt.ctx, evt.Topic, evt.Payload)
 							if err == nil {
 								b.log(LogLevelInfo, fmt.Sprintf("published event on %s topic", evt.Topic), nil, nil)
 								break
@@ -348,7 +349,7 @@ func (b *Bus) startHandler(ctx context.Context) {
 				for {
 					select {
 					case msg := <-subch:
-						err := hw.fn(ctx, msg.Data)
+						err := hw.fn(msg.Context, msg.Data)
 						if err != nil {
 							msg.Nack()
 							b.log(LogLevelError, "failed to handle event", err, map[string]any{"topic": topic})
@@ -479,6 +480,7 @@ func Publish(ctx context.Context, topic string, payload any, options ...func(*Ev
 		Type:          EVENT_MSG,
 		Topic:         topic,
 		Payload:       payloadBytes,
+		ctx:           ctx,
 		retry:         0,
 		backoff:       0,
 		Time:          time.Now().Unix(),
@@ -663,7 +665,7 @@ func Serve[T any, V any](fname string, fn RpcFunc[T, V]) error {
 		return err
 	}
 
-	respond := func(res any, topic, fname string, arrived time.Time) {
+	respond := func(ctx context.Context, res any, topic, fname string, arrived time.Time) {
 		dur := time.Since(arrived)
 		if err, ok := res.(ErrorResponse); ok {
 			_bus.log(LogLevelError, fmt.Sprintf("RPC - %s - %s", fname, dur), fmt.Errorf("code: %s, error: %s", err.Code, err.Message), nil)
@@ -676,7 +678,7 @@ func Serve[T any, V any](fname string, fn RpcFunc[T, V]) error {
 			_bus.log(LogLevelError, "failed to serialize RPC response", err, nil)
 			return
 		}
-		_bus.ps.Publish(_bus.ctx, topic, payload)
+		_bus.ps.Publish(ctx, topic, payload)
 	}
 
 	_bus.wg.Go(func() {
@@ -693,13 +695,13 @@ func Serve[T any, V any](fname string, fn RpcFunc[T, V]) error {
 				}
 
 				_bus.wg.Go(func() {
-					res, err := fn(_bus.ctx, req.Payload)
+					res, err := fn(msg.Context, req.Payload)
 					if err != nil {
-						respond(ErrorResponse{Code: "ErrRpc", Message: err.Error()}, req.ResTopic, fname, arrived)
+						respond(msg.Context, ErrorResponse{Code: "ErrRpc", Message: err.Error()}, req.ResTopic, fname, arrived)
 						return
 					}
 
-					respond(res, req.ResTopic, fname, arrived)
+					respond(msg.Context, res, req.ResTopic, fname, arrived)
 				})
 			case <-_bus.ctx.Done():
 				return
