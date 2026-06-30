@@ -108,10 +108,10 @@ type (
 		cfg        BusConfig
 		serializer Serializer
 
-		handlers   sync.Map
-		pubQueue   chan Event
-		started    bool
-		draining   bool
+		handlers sync.Map
+		pubQueue chan Event
+		started  bool
+		draining bool
 
 		ctx    context.Context
 		cancel context.CancelFunc
@@ -241,7 +241,6 @@ func (b *Bus) log(level LogLevel, msg string, err error, fields map[string]any) 
 
 func (b *Bus) monitor(ctx context.Context) {
 	b.wg.Go(func() {
-		defer b.wg.Done()
 		ticker := time.NewTicker(b.cfg.MonitorInterval)
 		defer ticker.Stop()
 
