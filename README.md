@@ -113,7 +113,7 @@ gobus.Serve(endpoint string, handler func(ctx context.Context, T) (T, error), op
 |--------|-------------|
 | `WithConcurrency(n)` | Number of concurrent handlers |
 | `WithRetry(n, delay)` | Retry n times with backoff delay |
-| `WithBackPressure()` | Apply backpressure on full queue |
+| `WithBackPressure()` | Apply broker flow control by keeping the subscription queue unbuffered while handlers are busy |
 | `WithExactlyOnce()` | Broker-level once delivery |
 | `WithDedup[T](ttl)` | Application-level dedup by correlation ID; persistent when using Redis/NATS backends |
 | `WithMiddleware(...)` | Chain middleware functions |

@@ -7,10 +7,10 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/propagation"
 	"github.com/zutrixpog/gobus/dedup"
 	"github.com/zutrixpog/gobus/pubsub"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 var (
@@ -66,8 +66,15 @@ func (n *NatsPubSub) Publish(ctx context.Context, topic string, data []byte) err
 
 func (n *NatsPubSub) Subscribe(ctx context.Context, topic string, opts pubsub.SubOptions) (chan pubsub.Message, error) {
 	appCh := make(chan pubsub.Message)
-	queueCh := make(chan pubsub.Message, 1024)
+	queueBuf := 1024
+	if opts.Backpressure {
+		queueBuf = 0
+	}
+	queueCh := make(chan pubsub.Message, queueBuf)
 
+	// NATS overrides AckWait with Backoff[0] whenever a backoff schedule is set,
+	// and rejects subscriptions requesting an AckWait that differs from an
+	// existing consumer's. Mirror it so re-subscribing to a durable consumer works.
 	if len(opts.Backoff) > 0 {
 		opts.AckWait = opts.Backoff[0]
 	}
@@ -100,9 +107,6 @@ func (n *NatsPubSub) Subscribe(ctx context.Context, topic string, opts pubsub.Su
 				if !ok {
 					break
 				}
-				if time.Since(data.Arrival) > opts.AckWait {
-					continue
-				}
 				select {
 				case appCh <- data:
 				case <-ctx.Done():
@@ -123,8 +127,15 @@ func (n *NatsPubSub) PublishOnce(ctx context.Context, topic string, data []byte)
 
 func (n *NatsPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubsub.SubOptions) (chan pubsub.Message, error) {
 	appCh := make(chan pubsub.Message)
-	queueCh := make(chan pubsub.Message, 1024)
+	queueBuf := 1024
+	if opts.Backpressure {
+		queueBuf = 0
+	}
+	queueCh := make(chan pubsub.Message, queueBuf)
 
+	// NATS overrides AckWait with Backoff[0] whenever a backoff schedule is set,
+	// and rejects subscriptions requesting an AckWait that differs from an
+	// existing consumer's. Mirror it so re-subscribing to a durable consumer works.
 	if len(opts.Backoff) > 0 {
 		opts.AckWait = opts.Backoff[0]
 	}
@@ -157,9 +168,6 @@ func (n *NatsPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubsu
 			case data, ok := <-queueCh:
 				if !ok {
 					break
-				}
-				if time.Since(data.Arrival) > opts.AckWait {
-					continue
 				}
 				select {
 				case appCh <- data:

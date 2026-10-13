@@ -15,9 +15,10 @@ type Message struct {
 }
 
 type SubOptions struct {
-	AckWait     time.Duration
-	MaxDelivers int
-	Backoff     []time.Duration
+	AckWait      time.Duration
+	MaxDelivers  int
+	Backoff      []time.Duration
+	Backpressure bool
 }
 
 // Fan-out methods: Publish, Subscribe - all subscribers receive the message

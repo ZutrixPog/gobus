@@ -55,7 +55,11 @@ func (r *RedisPubSub) Publish(ctx context.Context, topic string, data []byte) er
 }
 
 func (r *RedisPubSub) Subscribe(ctx context.Context, topic string, opts pubsub.SubOptions) (chan pubsub.Message, error) {
-	ch := make(chan pubsub.Message, r.bufferSize)
+	buf := r.bufferSize
+	if opts.Backpressure {
+		buf = 0
+	}
+	ch := make(chan pubsub.Message, buf)
 
 	pubsubConn := r.client.Subscribe(ctx, topic)
 	go func() {
@@ -108,7 +112,11 @@ func (r *RedisPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubs
 		}
 	}
 
-	ch := make(chan pubsub.Message, r.bufferSize)
+	buf := r.bufferSize
+	if opts.Backpressure {
+		buf = 0
+	}
+	ch := make(chan pubsub.Message, buf)
 
 	go func() {
 		defer close(ch)

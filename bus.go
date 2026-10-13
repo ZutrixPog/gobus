@@ -285,7 +285,7 @@ func (b *Bus) startPublisher(ctx context.Context) {
 						b.log(LogLevelError, fmt.Sprintf("failed to publish event, %d retries left", evt.retry), err, map[string]any{"topic": evt.Topic})
 
 						for evt.retry > 0 {
-							err = b.ps.Publish(evt.ctx, evt.Topic, evt.Payload)
+							err = b.ps.Publish(evt.ctx, evt.Topic, eventPayload)
 							if err == nil {
 								b.log(LogLevelInfo, fmt.Sprintf("published event on %s topic", evt.Topic), nil, nil)
 								break
@@ -326,15 +326,17 @@ func (b *Bus) startHandler(ctx context.Context) {
 				panic(fmt.Errorf("pub/sub does not support SubscribeOnce, cannot use WithExactlyOnce on topic %s", topic))
 			}
 			subch, err = wq.SubscribeOnce(ctx, topic, pubsub.SubOptions{
-				AckWait:     b.cfg.HandlerAckWait,
-				MaxDelivers: hw.retry,
-				Backoff:     backoffs,
+				AckWait:      b.cfg.HandlerAckWait,
+				MaxDelivers:  hw.retry,
+				Backoff:      backoffs,
+				Backpressure: hw.backpressure,
 			})
 		} else {
 			subch, err = b.ps.Subscribe(ctx, topic, pubsub.SubOptions{
-				AckWait:     b.cfg.HandlerAckWait,
-				MaxDelivers: hw.retry,
-				Backoff:     backoffs,
+				AckWait:      b.cfg.HandlerAckWait,
+				MaxDelivers:  hw.retry,
+				Backoff:      backoffs,
+				Backpressure: hw.backpressure,
 			})
 		}
 		if err != nil {
@@ -491,12 +493,12 @@ func Publish(ctx context.Context, topic string, payload any, options ...func(*Ev
 
 	select {
 	case _bus.pubQueue <- evt:
-	default:
-		<-_bus.pubQueue
-		_bus.pubQueue <- evt
-		return ErrQueueFull
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-_bus.ctx.Done():
+		return ErrDraining
 	}
-	return nil
 }
 
 func WithRetryQueue(n int, backoff time.Duration) func(*Event) {
