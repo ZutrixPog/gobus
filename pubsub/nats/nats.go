@@ -97,6 +97,13 @@ func messageDeliveries(msg *nats.Msg) uint64 {
 	return meta.NumDelivered
 }
 
+func normalizeAckWait(opts pubsub.SubOptions) pubsub.SubOptions {
+	if len(opts.Backoff) > 0 && opts.Backoff[len(opts.Backoff)-1] >= opts.AckWait {
+		opts.AckWait = opts.Backoff[len(opts.Backoff)-1] + time.Second
+	}
+	return opts
+}
+
 func (n *NatsPubSub) Publish(ctx context.Context, topic string, data []byte) error {
 	msg := &nats.Msg{Subject: topic, Data: data, Header: nats.Header{}}
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(msg.Header))
@@ -108,6 +115,7 @@ func (n *NatsPubSub) Publish(ctx context.Context, topic string, data []byte) err
 }
 
 func (n *NatsPubSub) Subscribe(ctx context.Context, topic string, opts pubsub.SubOptions) (chan pubsub.Message, error) {
+	opts = normalizeAckWait(opts)
 	appCh := make(chan pubsub.Message)
 	queueBuf := 1024
 	if opts.Backpressure {
@@ -169,6 +177,7 @@ func (n *NatsPubSub) PublishOnce(ctx context.Context, topic string, data []byte)
 }
 
 func (n *NatsPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubsub.SubOptions) (chan pubsub.Message, error) {
+	opts = normalizeAckWait(opts)
 	appCh := make(chan pubsub.Message)
 	queueBuf := 1024
 	if opts.Backpressure {
