@@ -720,7 +720,7 @@ func (b *Bus) startDLQReplayer(ctx context.Context) {
 		AckWait:     b.cfg.HandlerAckWait,
 		MaxDelivers: maxReplays,
 		Backoff:     backoffs,
-		Durable:     sanitize(b.cfg.ConsumerGroup + "-dlq-replayer"),
+		Durable:     "hamgram-dlq-replayer",
 		Deliver:     pubsub.DeliverAll,
 	})
 	if err != nil {
