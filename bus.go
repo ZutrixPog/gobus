@@ -359,8 +359,13 @@ func (b *Bus) startHandler(ctx context.Context) {
 			hw.backoff *= 2
 		}
 
+		ackWait := b.cfg.HandlerAckWait
+		if len(backoffs) > 0 && backoffs[len(backoffs)-1] >= ackWait {
+			ackWait = backoffs[len(backoffs)-1] + time.Second
+		}
+
 		opts := pubsub.SubOptions{
-			AckWait:      b.cfg.HandlerAckWait,
+			AckWait:      ackWait,
 			MaxDelivers:  hw.retry,
 			Backoff:      backoffs,
 			Backpressure: hw.backpressure,
