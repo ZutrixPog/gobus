@@ -9,8 +9,8 @@ import (
 )
 
 type RedisStore struct {
-	client     *redis.Client
-	prefix     string
+	client *redis.Client
+	prefix string
 }
 
 func NewRedisStore(client *redis.Client, prefix string) *RedisStore {
@@ -20,15 +20,16 @@ func NewRedisStore(client *redis.Client, prefix string) *RedisStore {
 	}
 }
 
-func (s *RedisStore) CheckAndMark(ctx context.Context, key string, ttl time.Duration) (bool, error) {
-	redisKey := fmt.Sprintf("%s:%s", s.prefix, key)
-
-	ok, err := s.client.SetNX(ctx, redisKey, "1", ttl).Result()
+func (s *RedisStore) Check(ctx context.Context, key string) (bool, error) {
+	n, err := s.client.Exists(ctx, fmt.Sprintf("%s:%s", s.prefix, key)).Result()
 	if err != nil {
 		return false, err
 	}
+	return n > 0, nil
+}
 
-	return ok, nil
+func (s *RedisStore) Mark(ctx context.Context, key string, ttl time.Duration) error {
+	return s.client.Set(ctx, fmt.Sprintf("%s:%s", s.prefix, key), "1", ttl).Err()
 }
 
 func (s *RedisStore) Close() error {

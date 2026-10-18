@@ -56,3 +56,23 @@ func TestPublishRetrySendsEnvelope(t *testing.T) {
 	require.NoError(t, b.serializer.Decode(msgs[0].Data, &evt), "retried payload must be a full Event envelope")
 	require.Equal(t, "test.topic", evt.Topic)
 }
+
+func TestPublishSyncBypassesQueue(t *testing.T) {
+	ps := pubsub.NewMockPubSub()
+	b := &Bus{
+		ps:         ps,
+		serializer: DefaultSerializer(),
+		cfg:        BusConfig{},
+		pubQueue:   make(chan Event, 1),
+		logCh:      make(chan LogEntry, 16),
+		ctx:        context.Background(),
+		started:    true,
+	}
+	old := _bus
+	_bus = b
+	defer func() { _bus = old }()
+
+	require.NoError(t, PublishSync(context.Background(), "test.sync", map[string]string{"a": "b"}))
+	require.Empty(t, b.pubQueue)
+	require.Len(t, ps.PublishedMessages(), 1)
+}

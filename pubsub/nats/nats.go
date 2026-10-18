@@ -54,6 +54,49 @@ func (n *NatsPubSub) Connected() bool {
 	return n.conn.Status() != nats.CLOSED
 }
 
+func (n *NatsPubSub) EnsureStream(name string, subjects []string, retention time.Duration, workQueue bool) error {
+	_, err := n.js.StreamInfo(name)
+	if err == nil {
+		return nil
+	}
+	if err != nats.ErrStreamNotFound {
+		return err
+	}
+
+	retentionPolicy := nats.LimitsPolicy
+	if workQueue {
+		retentionPolicy = nats.WorkQueuePolicy
+	}
+	_, err = n.js.AddStream(&nats.StreamConfig{
+		Name:      name,
+		Subjects:  subjects,
+		Retention: retentionPolicy,
+		MaxAge:    retention,
+		Storage:   nats.FileStorage,
+		Replicas:  1,
+	})
+	return err
+}
+
+func deliverOption(policy pubsub.DeliverPolicy) nats.SubOpt {
+	switch policy {
+	case pubsub.DeliverNew:
+		return nats.DeliverNew()
+	case pubsub.DeliverLast:
+		return nats.DeliverLast()
+	default:
+		return nats.DeliverAll()
+	}
+}
+
+func messageDeliveries(msg *nats.Msg) uint64 {
+	meta, err := msg.Metadata()
+	if err != nil {
+		return 0
+	}
+	return meta.NumDelivered
+}
+
 func (n *NatsPubSub) Publish(ctx context.Context, topic string, data []byte) error {
 	msg := &nats.Msg{Subject: topic, Data: data, Header: nats.Header{}}
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(msg.Header))
@@ -72,27 +115,27 @@ func (n *NatsPubSub) Subscribe(ctx context.Context, topic string, opts pubsub.Su
 	}
 	queueCh := make(chan pubsub.Message, queueBuf)
 
-	// NATS overrides AckWait with Backoff[0] whenever a backoff schedule is set,
-	// and rejects subscriptions requesting an AckWait that differs from an
-	// existing consumer's. Mirror it so re-subscribing to a durable consumer works.
-	if len(opts.Backoff) > 0 {
-		opts.AckWait = opts.Backoff[0]
-	}
-
-	sub, err := n.js.Subscribe(topic, func(msg *nats.Msg) {
-		queueCh <- pubsub.Message{
-			Data:    msg.Data,
-			Arrival: time.Now(),
-			Context: otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(msg.Header)),
-			Ack:     func() error { return msg.Ack() },
-			Nack:    func() error { return msg.Nak() },
-		}
-	},
+	subOpts := []nats.SubOpt{
 		nats.ManualAck(),
 		nats.AckWait(opts.AckWait),
 		nats.MaxDeliver(opts.MaxDelivers),
 		nats.BackOff(opts.Backoff),
-	)
+		deliverOption(opts.Deliver),
+	}
+	if opts.Durable != "" {
+		subOpts = append(subOpts, nats.Durable(opts.Durable))
+	}
+
+	sub, err := n.js.Subscribe(topic, func(msg *nats.Msg) {
+		queueCh <- pubsub.Message{
+			Data:       msg.Data,
+			Arrival:    time.Now(),
+			Context:    otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(msg.Header)),
+			Deliveries: messageDeliveries(msg),
+			Ack:        func() error { return msg.Ack() },
+			Nack:       func() error { return msg.Nak() },
+		}
+	}, subOpts...)
 	if err != nil {
 		close(appCh)
 		return appCh, err
@@ -133,28 +176,32 @@ func (n *NatsPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubsu
 	}
 	queueCh := make(chan pubsub.Message, queueBuf)
 
-	// NATS overrides AckWait with Backoff[0] whenever a backoff schedule is set,
-	// and rejects subscriptions requesting an AckWait that differs from an
-	// existing consumer's. Mirror it so re-subscribing to a durable consumer works.
-	if len(opts.Backoff) > 0 {
-		opts.AckWait = opts.Backoff[0]
+	workQueue := strings.ReplaceAll(topic, ".", "-")
+	if opts.Durable != "" {
+		workQueue = opts.Durable
 	}
 
-	workQueue := strings.ReplaceAll(topic, ".", "-")
-	sub, err := n.js.QueueSubscribe(topic, workQueue, func(msg *nats.Msg) {
-		queueCh <- pubsub.Message{
-			Data:    msg.Data,
-			Arrival: time.Now(),
-			Context: otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(msg.Header)),
-			Ack:     func() error { return msg.Ack() },
-			Nack:    func() error { return msg.Nak() },
-		}
-	},
+	subOpts := []nats.SubOpt{
 		nats.ManualAck(),
 		nats.AckWait(opts.AckWait),
 		nats.MaxDeliver(opts.MaxDelivers),
 		nats.BackOff(opts.Backoff),
-	)
+		deliverOption(opts.Deliver),
+	}
+	if opts.Durable != "" {
+		subOpts = append(subOpts, nats.Durable(opts.Durable))
+	}
+
+	sub, err := n.js.QueueSubscribe(topic, workQueue, func(msg *nats.Msg) {
+		queueCh <- pubsub.Message{
+			Data:       msg.Data,
+			Arrival:    time.Now(),
+			Context:    otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(msg.Header)),
+			Deliveries: messageDeliveries(msg),
+			Ack:        func() error { return msg.Ack() },
+			Nack:       func() error { return msg.Nak() },
+		}
+	}, subOpts...)
 	if err != nil {
 		close(appCh)
 		return appCh, fmt.Errorf("SubscribeOnce error: %v", err)
@@ -183,7 +230,11 @@ func (n *NatsPubSub) SubscribeOnce(ctx context.Context, topic string, opts pubsu
 	return appCh, nil
 }
 
-func (n *NatsPubSub) NewDedupStore(_ context.Context, instanceID string) (dedup.Store, error) {
-	bucket := fmt.Sprintf("gobus_dedup_%s", strings.ReplaceAll(instanceID, "-", "_"))
+func (n *NatsPubSub) NewDedupStore(_ context.Context, group string) (dedup.Store, error) {
+	bucket := fmt.Sprintf("gobus_dedup_%s", sanitizeStoreName(group))
 	return dedup.NewNatsStore(n.js, bucket, 0)
+}
+
+func sanitizeStoreName(value string) string {
+	return strings.ReplaceAll(value, "-", "_")
 }

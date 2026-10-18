@@ -17,17 +17,19 @@ func TestMemoryStore(t *testing.T) {
 	key := "test-key-1"
 	ttl := time.Minute
 
-	ok, err := store.CheckAndMark(ctx, key, ttl)
+	seen, err := store.Check(ctx, key)
 	require.Nil(t, err)
-	require.True(t, ok)
+	require.False(t, seen)
 
-	ok, err = store.CheckAndMark(ctx, key, ttl)
-	require.Nil(t, err)
-	require.False(t, ok)
+	require.Nil(t, store.Mark(ctx, key, ttl))
 
-	ok, err = store.CheckAndMark(ctx, "different-key", ttl)
+	seen, err = store.Check(ctx, key)
 	require.Nil(t, err)
-	require.True(t, ok)
+	require.True(t, seen)
+
+	seen, err = store.Check(ctx, "different-key")
+	require.Nil(t, err)
+	require.False(t, seen)
 }
 
 func TestMemoryStoreExpiry(t *testing.T) {
@@ -38,17 +40,15 @@ func TestMemoryStoreExpiry(t *testing.T) {
 	key := "expiring-key"
 	ttl := 100 * time.Millisecond
 
-	ok, err := store.CheckAndMark(ctx, key, ttl)
-	require.Nil(t, err)
-	require.True(t, ok)
+	require.Nil(t, store.Mark(ctx, key, ttl))
 
-	ok, err = store.CheckAndMark(ctx, key, ttl)
+	seen, err := store.Check(ctx, key)
 	require.Nil(t, err)
-	require.False(t, ok)
+	require.True(t, seen)
 
 	time.Sleep(150 * time.Millisecond)
 
-	ok, err = store.CheckAndMark(ctx, key, ttl)
+	seen, err = store.Check(ctx, key)
 	require.Nil(t, err)
-	require.True(t, ok)
+	require.False(t, seen)
 }

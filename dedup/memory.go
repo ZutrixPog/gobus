@@ -7,9 +7,9 @@ import (
 )
 
 type MemoryStore struct {
-	mu     sync.RWMutex
-	keys   map[string]time.Time
-	done   chan struct{}
+	mu   sync.RWMutex
+	keys map[string]time.Time
+	done chan struct{}
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -20,17 +20,20 @@ func NewMemoryStore() *MemoryStore {
 	return s
 }
 
-func (s *MemoryStore) CheckAndMark(_ context.Context, key string, ttl time.Duration) (bool, error) {
+func (s *MemoryStore) Check(_ context.Context, key string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	expiry, ok := s.keys[key]
+	return ok && time.Now().Before(expiry), nil
+}
+
+func (s *MemoryStore) Mark(_ context.Context, key string, ttl time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now()
-	if expiry, ok := s.keys[key]; ok && now.Before(expiry) {
-		return false, nil
-	}
-
-	s.keys[key] = now.Add(ttl)
-	return true, nil
+	s.keys[key] = time.Now().Add(ttl)
+	return nil
 }
 
 func (s *MemoryStore) Close() error {

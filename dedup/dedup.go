@@ -6,7 +6,8 @@ import (
 )
 
 type Store interface {
-	CheckAndMark(ctx context.Context, key string, ttl time.Duration) (bool, error)
+	Check(ctx context.Context, key string) (bool, error)
+	Mark(ctx context.Context, key string, ttl time.Duration) error
 	Close() error
 }
 

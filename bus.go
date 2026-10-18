@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,7 @@ type (
 
 	Event struct {
 		CorrelationID string    `json:"correlation_id"`
+		EventID       string    `json:"event_id"`
 		TraceID       string    `json:"trace_id"`
 		Type          EventType `json:"event_type"`
 		UserID        string    `json:"user_id"`
@@ -49,6 +51,21 @@ type (
 
 		ctx  context.Context
 		Time int64 `json:"published"`
+	}
+
+	DeadLetter struct {
+		OriginalTopic string    `json:"original_topic"`
+		RawEvent      []byte    `json:"raw_event"`
+		Error         string    `json:"error"`
+		Attempts      uint64    `json:"attempts"`
+		FailedAt      time.Time `json:"failed_at"`
+	}
+
+	Metrics interface {
+		Publish(topic string, dur time.Duration, err error)
+		Handle(topic string, dur time.Duration, deliveries uint64, err error)
+		Dedup(topic string, hit bool, err error)
+		DeadLetter(topic string, parked bool, err error)
 	}
 
 	EventStore interface {
@@ -78,9 +95,11 @@ type (
 	}
 
 	BusConfig struct {
-		RpcPrefix  string
-		Serializer Serializer
-		InstanceID string
+		RpcPrefix     string
+		Serializer    Serializer
+		InstanceID    string
+		ConsumerGroup string
+		Metrics       Metrics
 
 		PublishQueueSize int
 		LogChannelSize   int
@@ -91,6 +110,9 @@ type (
 		HandlerAckWait time.Duration
 		RpcAckWait     time.Duration
 		RpcTimeout     time.Duration
+		DLQMaxReplays  int
+		DLQReplayDelay time.Duration
+		DLQRetention   time.Duration
 	}
 
 	LogLevel string
@@ -121,6 +143,7 @@ type (
 		startedAt  time.Time
 		instanceID string
 		dedupStore dedup.Store
+		metrics    Metrics
 	}
 )
 
@@ -174,9 +197,21 @@ func Init(ps pubsub.PubSub, cfg BusConfig) *Bus {
 		if cfg.RpcTimeout == 0 {
 			cfg.RpcTimeout = 3 * time.Second
 		}
+		if cfg.DLQMaxReplays == 0 {
+			cfg.DLQMaxReplays = 10
+		}
+		if cfg.DLQReplayDelay == 0 {
+			cfg.DLQReplayDelay = 5 * time.Second
+		}
+		if cfg.DLQRetention == 0 {
+			cfg.DLQRetention = 7 * 24 * time.Hour
+		}
 
 		if cfg.InstanceID == "" {
 			cfg.InstanceID = uuid.New().String()
+		}
+		if cfg.ConsumerGroup == "" {
+			cfg.ConsumerGroup = cfg.InstanceID
 		}
 
 		_bus = &Bus{
@@ -194,6 +229,7 @@ func Init(ps pubsub.PubSub, cfg BusConfig) *Bus {
 
 			logCh:      make(chan LogEntry, cfg.LogChannelSize),
 			instanceID: cfg.InstanceID,
+			metrics:    cfg.Metrics,
 		}
 
 		_bus.initDedupStore()
@@ -204,7 +240,7 @@ func Init(ps pubsub.PubSub, cfg BusConfig) *Bus {
 
 func (b *Bus) initDedupStore() {
 	if provider, ok := b.ps.(dedup.Provider); ok {
-		store, err := provider.NewDedupStore(b.ctx, b.instanceID)
+		store, err := provider.NewDedupStore(b.ctx, b.cfg.ConsumerGroup)
 		if err != nil {
 			b.log(LogLevelWarn, "failed to create backend dedup store, falling back to memory", err, nil)
 		} else {
@@ -274,30 +310,34 @@ func (b *Bus) startPublisher(ctx context.Context) {
 			select {
 			case evt := <-b.pubQueue:
 				b.wg.Go(func() {
+					started := time.Now()
 					eventPayload, err := b.serializer.Encode(evt)
 					if err != nil {
+						b.metricPublish(evt.Topic, time.Since(started), err)
 						b.log(LogLevelError, "failed to serialize event", err, map[string]any{"topic": evt.Topic})
 						return
 					}
 
-					err = b.ps.Publish(evt.ctx, evt.Topic, eventPayload)
-					if err != nil {
-						b.log(LogLevelError, fmt.Sprintf("failed to publish event, %d retries left", evt.retry), err, map[string]any{"topic": evt.Topic})
-
-						for evt.retry > 0 {
-							err = b.ps.Publish(evt.ctx, evt.Topic, eventPayload)
-							if err == nil {
-								b.log(LogLevelInfo, fmt.Sprintf("published event on %s topic", evt.Topic), nil, nil)
-								break
-							}
-
-							b.log(LogLevelWarn, "event publish retry failed", err, map[string]any{"topic": evt.Topic})
-							time.Sleep(evt.backoff)
-
-							evt.retry -= 1
-							evt.backoff *= 2
+					attempts := evt.retry
+					for {
+						err = b.ps.Publish(evt.ctx, evt.Topic, eventPayload)
+						if err == nil || attempts <= 0 {
+							break
 						}
+
+						b.log(LogLevelWarn, "event publish retry failed", err, map[string]any{"topic": evt.Topic})
+						time.Sleep(evt.backoff)
+						evt.backoff *= 2
+						attempts--
 					}
+
+					b.metricPublish(evt.Topic, time.Since(started), err)
+					if err != nil {
+						b.log(LogLevelError, "failed to publish event", err, map[string]any{"topic": evt.Topic})
+						b.deadLetter(evt.ctx, evt.Topic, eventPayload, err, 0)
+						return
+					}
+					b.log(LogLevelInfo, fmt.Sprintf("published event on %s topic", evt.Topic), nil, nil)
 				})
 			case <-ctx.Done():
 				return
@@ -319,25 +359,24 @@ func (b *Bus) startHandler(ctx context.Context) {
 			hw.backoff *= 2
 		}
 
+		opts := pubsub.SubOptions{
+			AckWait:      b.cfg.HandlerAckWait,
+			MaxDelivers:  hw.retry,
+			Backoff:      backoffs,
+			Backpressure: hw.backpressure,
+			Durable:      b.durableName(topic),
+			Deliver:      pubsub.DeliverNew,
+		}
+
 		var subch chan pubsub.Message
 		var err error
 		if hw.once {
 			if !ok {
 				panic(fmt.Errorf("pub/sub does not support SubscribeOnce, cannot use WithExactlyOnce on topic %s", topic))
 			}
-			subch, err = wq.SubscribeOnce(ctx, topic, pubsub.SubOptions{
-				AckWait:      b.cfg.HandlerAckWait,
-				MaxDelivers:  hw.retry,
-				Backoff:      backoffs,
-				Backpressure: hw.backpressure,
-			})
+			subch, err = wq.SubscribeOnce(ctx, topic, opts)
 		} else {
-			subch, err = b.ps.Subscribe(ctx, topic, pubsub.SubOptions{
-				AckWait:      b.cfg.HandlerAckWait,
-				MaxDelivers:  hw.retry,
-				Backoff:      backoffs,
-				Backpressure: hw.backpressure,
-			})
+			subch, err = b.ps.Subscribe(ctx, topic, opts)
 		}
 		if err != nil {
 			b.log(LogLevelError, "failed to subscribe to pubsub", err, map[string]any{"topic": topic})
@@ -350,12 +389,23 @@ func (b *Bus) startHandler(ctx context.Context) {
 				for {
 					select {
 					case msg := <-subch:
+						started := time.Now()
 						err := hw.fn(msg.Context, msg.Data)
+						b.metricHandle(topic, time.Since(started), msg.Deliveries, err)
 						if err != nil {
-							msg.Nack()
+							maxDeliveries := hw.retry
+							if maxDeliveries < 1 {
+								maxDeliveries = 1
+							}
+							if msg.Deliveries >= uint64(maxDeliveries) {
+								b.deadLetter(msg.Context, topic, msg.Data, err, msg.Deliveries)
+								_ = msg.Ack()
+							} else {
+								_ = msg.Nack()
+							}
 							b.log(LogLevelError, "failed to handle event", err, map[string]any{"topic": topic})
 						} else {
-							msg.Ack()
+							_ = msg.Ack()
 						}
 					case <-ctx.Done():
 						return
@@ -444,15 +494,34 @@ func WithDedup[T any](dur time.Duration) func(*HandlerWrapper) {
 	return func(hw *HandlerWrapper) {
 		var mid Middleware[T] = func(next HandlerFunc[T]) HandlerFunc[T] {
 			return func(ctx context.Context, evt T, meta Event) error {
-				ok, err := _bus.dedupStore.CheckAndMark(ctx, meta.CorrelationID, dur)
+				key := meta.EventID
+				if key == "" {
+					key = meta.CorrelationID
+				}
+
+				seen, err := _bus.dedupStore.Check(ctx, key)
 				if err != nil {
+					_bus.metricDedup(hw.topic, false, err)
 					_bus.log(LogLevelError, "dedup check failed, allowing message through", err, map[string]any{"topic": hw.topic})
 					return next(ctx, evt, meta)
 				}
-				if !ok {
+				if seen {
+					_bus.metricDedup(hw.topic, true, nil)
 					return nil
 				}
-				return next(ctx, evt, meta)
+
+				if err := next(ctx, evt, meta); err != nil {
+					_bus.metricDedup(hw.topic, false, nil)
+					return err
+				}
+
+				if err := _bus.dedupStore.Mark(ctx, key, dur); err != nil {
+					_bus.log(LogLevelError, "dedup mark failed, handler already succeeded", err, map[string]any{"topic": hw.topic})
+					_bus.metricDedup(hw.topic, false, err)
+					return nil
+				}
+				_bus.metricDedup(hw.topic, false, nil)
+				return nil
 			}
 		}
 
@@ -460,7 +529,7 @@ func WithDedup[T any](dur time.Duration) func(*HandlerWrapper) {
 	}
 }
 
-func Publish(ctx context.Context, topic string, payload any, options ...func(*Event)) error {
+func newEvent(ctx context.Context, topic string, payload any, options ...func(*Event)) (Event, error) {
 	if _bus == nil {
 		panic(ErrNotInit)
 	}
@@ -468,12 +537,12 @@ func Publish(ctx context.Context, topic string, payload any, options ...func(*Ev
 		panic(ErrNotStarted)
 	}
 	if _bus.draining {
-		return ErrDraining
+		return Event{}, ErrDraining
 	}
 
 	payloadBytes, err := _bus.serializer.Encode(payload)
 	if err != nil {
-		return fmt.Errorf("%w: %s", ErrSerDe, err.Error())
+		return Event{}, fmt.Errorf("%w: %s", ErrSerDe, err.Error())
 	}
 
 	evt := Event{
@@ -491,6 +560,15 @@ func Publish(ctx context.Context, topic string, payload any, options ...func(*Ev
 		opt(&evt)
 	}
 
+	return evt, nil
+}
+
+func Publish(ctx context.Context, topic string, payload any, options ...func(*Event)) error {
+	evt, err := newEvent(ctx, topic, payload, options...)
+	if err != nil {
+		return err
+	}
+
 	select {
 	case _bus.pubQueue <- evt:
 		return nil
@@ -501,10 +579,33 @@ func Publish(ctx context.Context, topic string, payload any, options ...func(*Ev
 	}
 }
 
+func PublishSync(ctx context.Context, topic string, payload any, options ...func(*Event)) error {
+	evt, err := newEvent(ctx, topic, payload, options...)
+	if err != nil {
+		return err
+	}
+
+	raw, err := _bus.serializer.Encode(evt)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrSerDe, err.Error())
+	}
+
+	started := time.Now()
+	err = _bus.ps.Publish(ctx, topic, raw)
+	_bus.metricPublish(topic, time.Since(started), err)
+	return err
+}
+
 func WithRetryQueue(n int, backoff time.Duration) func(*Event) {
 	return func(evt *Event) {
 		evt.retry = n
 		evt.backoff = backoff
+	}
+}
+
+func WithEventID(id string) func(*Event) {
+	return func(evt *Event) {
+		evt.EventID = id
 	}
 }
 
@@ -517,6 +618,170 @@ func WithCorrelationID(id string) func(*Event) {
 func WithTraceID(id string) func(*Event) {
 	return func(evt *Event) {
 		evt.TraceID = id
+	}
+}
+
+func sanitize(value string) string {
+	mapped := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+			return r
+		default:
+			return '_'
+		}
+	}, value)
+	mapped = strings.Trim(mapped, "_")
+	if mapped == "" {
+		return "topic"
+	}
+	return mapped
+}
+
+func (b *Bus) durableName(topic string) string {
+	return sanitize(b.cfg.ConsumerGroup + "-" + topic)
+}
+
+func dlqSubject(topic string) string {
+	return "hamgram.dlq." + sanitize(topic)
+}
+
+func parkedSubject(topic string) string {
+	return "hamgram.parked." + sanitize(topic)
+}
+
+type streamEnsurer interface {
+	EnsureStream(name string, subjects []string, retention time.Duration, workQueue bool) error
+}
+
+func (b *Bus) ensureDLQ() bool {
+	se, ok := b.ps.(streamEnsurer)
+	if !ok {
+		b.log(LogLevelWarn, "pubsub does not support dead-letter streams", nil, nil)
+		return false
+	}
+	if err := se.EnsureStream("hamgram_dlq", []string{"hamgram.dlq.*"}, b.cfg.DLQRetention, true); err != nil {
+		b.log(LogLevelError, "failed to ensure dead-letter stream", err, nil)
+		return false
+	}
+	if err := se.EnsureStream("hamgram_dlq_parked", []string{"hamgram.parked.*"}, b.cfg.DLQRetention, false); err != nil {
+		b.log(LogLevelError, "failed to ensure parked stream", err, nil)
+		return false
+	}
+	return true
+}
+
+func (b *Bus) deadLetter(ctx context.Context, topic string, raw []byte, cause error, attempts uint64) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	payload, err := b.serializer.Encode(DeadLetter{
+		OriginalTopic: topic,
+		RawEvent:      raw,
+		Error:         cause.Error(),
+		Attempts:      attempts,
+		FailedAt:      time.Now(),
+	})
+	if err != nil {
+		b.metricDeadLetter(topic, false, err)
+		b.log(LogLevelError, "failed to encode dead letter", err, map[string]any{"topic": topic})
+		return
+	}
+	err = b.ps.Publish(ctx, dlqSubject(topic), payload)
+	b.metricDeadLetter(topic, false, err)
+	if err != nil {
+		b.log(LogLevelError, "failed to publish dead letter", err, map[string]any{"topic": topic})
+	}
+}
+
+func (b *Bus) park(ctx context.Context, dl DeadLetter) error {
+	payload, err := b.serializer.Encode(dl)
+	if err != nil {
+		return err
+	}
+	return b.ps.Publish(ctx, parkedSubject(dl.OriginalTopic), payload)
+}
+
+func (b *Bus) startDLQReplayer(ctx context.Context) {
+	maxReplays := b.cfg.DLQMaxReplays
+	if maxReplays < 1 {
+		maxReplays = 1
+	}
+	backoffs := make([]time.Duration, 0, maxReplays)
+	for i := 0; i < maxReplays; i++ {
+		backoffs = append(backoffs, b.cfg.DLQReplayDelay)
+	}
+
+	subch, err := b.ps.SubscribeOnce(ctx, "hamgram.dlq.*", pubsub.SubOptions{
+		AckWait:     b.cfg.HandlerAckWait,
+		MaxDelivers: maxReplays,
+		Backoff:     backoffs,
+		Durable:     sanitize(b.cfg.ConsumerGroup + "-dlq-replayer"),
+		Deliver:     pubsub.DeliverAll,
+	})
+	if err != nil {
+		b.log(LogLevelError, "failed to start dead-letter replayer", err, nil)
+		return
+	}
+
+	b.wg.Go(func() {
+		for {
+			select {
+			case msg := <-subch:
+				var dl DeadLetter
+				if err := b.serializer.Decode(msg.Data, &dl); err != nil {
+					b.metricDeadLetter("unknown", false, err)
+					b.log(LogLevelError, "failed to decode dead letter", err, nil)
+					_ = msg.Ack()
+					continue
+				}
+
+				if msg.Deliveries >= uint64(maxReplays) {
+					if err := b.park(msg.Context, dl); err != nil {
+						b.metricDeadLetter(dl.OriginalTopic, true, err)
+						b.log(LogLevelError, "failed to park dead letter", err, map[string]any{"topic": dl.OriginalTopic})
+						_ = msg.Nack()
+						continue
+					}
+					b.metricDeadLetter(dl.OriginalTopic, true, nil)
+					_ = msg.Ack()
+					continue
+				}
+
+				if err := b.ps.Publish(msg.Context, dl.OriginalTopic, dl.RawEvent); err != nil {
+					b.metricDeadLetter(dl.OriginalTopic, false, err)
+					b.log(LogLevelWarn, "dead-letter replay failed", err, map[string]any{"topic": dl.OriginalTopic})
+					_ = msg.Nack()
+					continue
+				}
+				_ = msg.Ack()
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
+}
+
+func (b *Bus) metricPublish(topic string, dur time.Duration, err error) {
+	if b.metrics != nil {
+		b.metrics.Publish(topic, dur, err)
+	}
+}
+
+func (b *Bus) metricHandle(topic string, dur time.Duration, deliveries uint64, err error) {
+	if b.metrics != nil {
+		b.metrics.Handle(topic, dur, deliveries, err)
+	}
+}
+
+func (b *Bus) metricDedup(topic string, hit bool, err error) {
+	if b.metrics != nil {
+		b.metrics.Dedup(topic, hit, err)
+	}
+}
+
+func (b *Bus) metricDeadLetter(topic string, parked bool, err error) {
+	if b.metrics != nil {
+		b.metrics.DeadLetter(topic, parked, err)
 	}
 }
 
@@ -720,6 +985,9 @@ func Start() error {
 
 	_bus.startPublisher(ctx)
 	_bus.startHandler(ctx)
+	if _bus.ensureDLQ() {
+		_bus.startDLQReplayer(ctx)
+	}
 
 	_bus.started = true
 	_bus.startedAt = time.Now()

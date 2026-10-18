@@ -3,6 +3,7 @@ package bus_test
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -227,6 +228,30 @@ func TestWithDedup(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 	require.Equal(t, 1, count, "only first message should be processed, got %d", count)
+}
+
+func TestDedupMarksOnlyAfterSuccess(t *testing.T) {
+	topic := "gobus.test-dedup-after-success"
+	ctx := context.Background()
+	bus.Init(ps.(pubsub.PubSub), bus.BusConfig{})
+
+	var calls atomic.Int32
+	bus.Handle(topic, func(ctx context.Context, evt TestEvent, meta bus.Event) error {
+		if calls.Add(1) == 1 {
+			return fmt.Errorf("transient failure")
+		}
+		return nil
+	}, bus.WithDedup[TestEvent](time.Minute), bus.WithRetry(3, 50*time.Millisecond))
+
+	require.Nil(t, bus.Start())
+
+	eventID := "stable-event-id"
+	require.Nil(t, bus.Publish(ctx, topic, TestEvent{Name: "retry"}, bus.WithEventID(eventID)))
+	require.Eventually(t, func() bool { return calls.Load() >= 2 }, 2*time.Second, 20*time.Millisecond)
+
+	require.Nil(t, bus.Publish(ctx, topic, TestEvent{Name: "duplicate"}, bus.WithEventID(eventID)))
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, int32(2), calls.Load(), "successful handling should mark the stable event id")
 }
 
 func TestLogChannel(t *testing.T) {

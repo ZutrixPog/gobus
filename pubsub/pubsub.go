@@ -6,19 +6,30 @@ import (
 )
 
 type Message struct {
-	Data    []byte
-	Arrival time.Time
-	Context context.Context
+	Data       []byte
+	Arrival    time.Time
+	Context    context.Context
+	Deliveries uint64
 
 	Ack  func() error
 	Nack func() error
 }
+
+type DeliverPolicy string
+
+const (
+	DeliverAll  DeliverPolicy = "all"
+	DeliverNew  DeliverPolicy = "new"
+	DeliverLast DeliverPolicy = "last"
+)
 
 type SubOptions struct {
 	AckWait      time.Duration
 	MaxDelivers  int
 	Backoff      []time.Duration
 	Backpressure bool
+	Durable      string
+	Deliver      DeliverPolicy
 }
 
 // Fan-out methods: Publish, Subscribe - all subscribers receive the message
